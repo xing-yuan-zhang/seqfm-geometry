@@ -1,22 +1,20 @@
-# src/data_utils/uniprot_client.py
 from __future__ import annotations
 
-import re
-import json
-import time
-import yaml
-import argparse
-import logging
-import hashlib
+import argparse, hashlib, json, logging, re, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import requests
-import pandas as pd
+import requests, yaml
+
+CHUNK = 1024 * 1024
+
+UNIPROT_RE = re.compile(
+    r"\b([A-NR-Z][0-9][A-Z0-9]{3}[0-9]|[OPQ][0-9][A-Z0-9]{3}[0-9]|A0A[0-9A-Z]{7})\b"
+)
 
 
-def sha256(p: Path) -> str:
+def sha256(p: Path):
     h = hashlib.sha256()
     with p.open("rb") as f:
         for c in iter(lambda: f.read(CHUNK), b""):
@@ -24,27 +22,29 @@ def sha256(p: Path) -> str:
     return h.hexdigest()
 
 
+def _ensure(p: Path):
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+
 def download(url: str, out: Path, overwrite=False, timeout=60):
-    out.parent.mkdir(parents=True, exist_ok=True)
+    _ensure(out)
     if out.exists() and not overwrite:
         return
 
     tmp = out.with_suffix(out.suffix + ".partial")
-    headers = {}
-    offset = tmp.stat().st_size if tmp.exists() else 0
-    if offset > 0:
+    headers, offset = {}, (tmp.stat().st_size if tmp.exists() else 0)
+    if offset:
         headers["Range"] = f"bytes={offset}-"
 
     with requests.get(url, stream=True, headers=headers, timeout=timeout) as r:
         r.raise_for_status()
-        mode = "ab" if offset > 0 else "wb"
-        with tmp.open(mode) as f:
+        with tmp.open("ab" if offset else "wb") as f:
             for c in r.iter_content(chunk_size=CHUNK):
                 if c:
                     f.write(c)
 
     tmp.replace(out)
-    print(f"{out} ({out.stat().st_size / 1e6:.2f} MB)")
+    print(f"{out} ({out.stat().st_size/1e6:.2f} MB)")
 
 
 def dataloader_main(
@@ -66,7 +66,6 @@ def dataloader_main(
         f"{taxid}.protein.physical.links.detailed.{string_version}.txt.gz",
         f"{taxid}.protein.sequences.{string_version}.fa.gz",
     ]
-
     for fn in files:
         try:
             download(f"{base}/{fn}", string_dir / fn, overwrite=overwrite)
@@ -76,10 +75,7 @@ def dataloader_main(
     if with_biogrid:
         bg_dir = root / "inputs/ppi/BioGRID"
         bg_base = "https://downloads.thebiogrid.org/BioGRID/Latest-Release"
-        for fn in [
-            "BIOGRID-ALL-LATEST.mitab.zip",
-            "BIOGRID-MV-Physical-LATEST.mitab.zip",
-        ]:
+        for fn in ["BIOGRID-ALL-LATEST.mitab.zip", "BIOGRID-MV-Physical-LATEST.mitab.zip"]:
             try:
                 download(f"{bg_base}/{fn}", bg_dir / fn, overwrite=overwrite)
             except Exception as e:
@@ -116,14 +112,11 @@ class UniProtClient:
     def _save(self):
         if not self.cache_path:
             return
-        Path(self.cache_path).parent.mkdir(parents=True, exist_ok=True)
-        json.dump(self.cache, open(self.cache_path, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+        p = Path(self.cache_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        json.dump(self.cache, p.open("w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
     def search(self, query: str, taxon_id: int, fields=None):
-        key = f"{query}|{taxon_id}|{','.join(fields or [])}"
-        if key in self.cache:
-            return self.cache[key]
-
         if fields is None:
             fields = [
                 "accession",
@@ -135,6 +128,9 @@ class UniProtClient:
                 "length",
                 "reviewed",
             ]
+        key = f"{query}|{taxon_id}|{','.join(fields)}"
+        if key in self.cache:
+            return self.cache[key]
 
         url = f"{self.cfg.endpoint}/uniprotkb/search"
         params = {
@@ -159,7 +155,6 @@ class UniProtClient:
             except Exception as e:
                 last = e
                 time.sleep(0.5 * (i + 1))
-
         raise RuntimeError(f"UniProt query failed: {query}") from last
 
 
@@ -167,9 +162,9 @@ class UniProtClient:
 class Scope:
     taxon_id: int
     canonical_id: str
-    allow_multiple_uniprot_hits: bool
-    fail_on_unmapped: bool
-    fail_on_ambiguous: bool
+    allow_multiple_uniprot_hits: bool = False
+    fail_on_unmapped: bool = True
+    fail_on_ambiguous: bool = True
 
 
 def setup_logger(path: str, level="INFO"):
@@ -177,10 +172,11 @@ def setup_logger(path: str, level="INFO"):
     lg.setLevel(getattr(logging, level.upper(), logging.INFO))
     lg.handlers.clear()
 
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    fh = logging.FileHandler(path, encoding="utf-8")
+    fh = logging.FileHandler(p, encoding="utf-8")
     fh.setFormatter(fmt)
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
@@ -194,69 +190,64 @@ def load_yaml(p: str):
     return yaml.safe_load(open(p, "r", encoding="utf-8"))
 
 
-def parse_scope(y):
+def parse_scope(y) -> Scope:
+    org = y.get("organism", {})
+    pol = y.get("id_policy", {})
+    qg = y.get("quality_gate", {})
     return Scope(
-        taxon_id=int(y["organism"]["taxon_id"]),
-        canonical_id=y["id_policy"]["canonical_id"],
-        allow_multiple_uniprot_hits=bool(y["id_policy"].get("allow_multiple_uniprot_hits", False)),
-        fail_on_unmapped=bool(y["quality_gate"].get("fail_on_unmapped", True)),
-        fail_on_ambiguous=bool(y["quality_gate"].get("fail_on_ambiguous", True)),
+        taxon_id=int(org["taxon_id"]),
+        canonical_id=pol["canonical_id"],
+        allow_multiple_uniprot_hits=bool(pol.get("allow_multiple_uniprot_hits", False)),
+        fail_on_unmapped=bool(qg.get("fail_on_unmapped", True)),
+        fail_on_ambiguous=bool(qg.get("fail_on_ambiguous", True)),
     )
 
 
 def best_hit(query: str, hits: list[dict]):
     q = query.upper()
 
-    def score(h):
-        reviewed = int("reviewed" in str(h.get("entryType", "")).lower())
-        genes = h.get("genes") or []
-        gp = ""
-        syn = set()
-        if genes:
-            g0 = genes[0] or {}
-            gp = ((g0.get("geneName") or {}).get("value") or "").upper()
-            for s in g0.get("synonyms") or []:
-                v = (s or {}).get("value")
-                if isinstance(v, str):
-                    syn.add(v.upper())
+    def gene_bits(h):
+        g0 = (h.get("genes") or [{}])[0] or {}
+        gp = ((g0.get("geneName") or {}).get("value") or "").upper()
+        syn = {
+            (s or {}).get("value", "").upper()
+            for s in (g0.get("synonyms") or [])
+            if isinstance((s or {}).get("value"), str)
+        }
+        return gp, syn
 
-        pname = (
+    def protein_name(h):
+        return (
             ((h.get("proteinDescription") or {}).get("recommendedName") or {})
             .get("fullName", {})
             .get("value", "")
             .lower()
         )
 
+    def score(h):
+        reviewed = int("reviewed" in str(h.get("entryType", "")).lower())
+        gp, syn = gene_bits(h)
+        pname = protein_name(h)
         iso = int("isoform" in pname)
         length = int((h.get("sequence") or {}).get("length") or 0)
-
         return (reviewed, gp == q, q in syn, -iso, length)
 
     if not hits:
         return None
-
     ranked = sorted(hits, key=score, reverse=True)
     if len(ranked) == 1:
         return ranked[0]
-
-    if score(ranked[0]) == score(ranked[1]):
-        return None
-
-    return ranked[0]
+    return None if score(ranked[0]) == score(ranked[1]) else ranked[0]
 
 
 def hit_row(h):
-    genes = h.get("genes") or []
-    gp = ""
-    if genes:
-        gp = ((genes[0].get("geneName") or {}).get("value")) or ""
-
+    g0 = (h.get("genes") or [{}])[0] or {}
+    gp = ((g0.get("geneName") or {}).get("value")) or ""
     pname = (
         ((h.get("proteinDescription") or {}).get("recommendedName") or {})
         .get("fullName", {})
         .get("value", "")
     )
-
     return {
         "uniprot_acc": h.get("primaryAccession", ""),
         "uniprot_id": h.get("uniProtkbId", ""),
@@ -269,26 +260,23 @@ def hit_row(h):
 
 
 def write_tsv(path: str, rows: list[dict]):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        raise ValueError()
-
+        raise ValueError("no rows")
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     cols = list(rows[0].keys())
-    with open(path, "w", encoding="utf-8") as f:
+    with p.open("w", encoding="utf-8") as f:
         f.write("\t".join(cols) + "\n")
         for r in rows:
             f.write("\t".join(str(r.get(c, "")) for c in cols) + "\n")
 
 
 def uniprot_main(scope_path, seeds_path, cache_path, out_tsv, out_json, log_path):
-    scope_y = load_yaml(scope_path)
-    seeds_y = load_yaml(seeds_path)
+    scope_y, seeds_y = load_yaml(scope_path), load_yaml(seeds_path)
     scope = parse_scope(scope_y)
 
     logger = setup_logger(log_path, scope_y.get("logging", {}).get("level", "INFO"))
-
-    cfg = UniProtClientConfig(**scope_y.get("uniprot", {}))
-    client = UniProtClient(cfg, cache_path)
+    client = UniProtClient(UniProtClientConfig(**scope_y.get("uniprot", {})), cache_path)
 
     seeds = seeds_y.get("seeds", [])
     if not seeds:
@@ -318,14 +306,11 @@ def uniprot_main(scope_path, seeds_path, cache_path, out_tsv, out_json, log_path
 
         row = hit_row(hits[0])
         row.update(
-            {
-                "query": q,
-                "role": s.get("role", ""),
-                "notes": s.get("notes", ""),
-                "evidence": json.dumps(s.get("evidence", []), ensure_ascii=False),
-            }
+            query=q,
+            role=s.get("role", ""),
+            notes=s.get("notes", ""),
+            evidence=json.dumps(s.get("evidence", []), ensure_ascii=False),
         )
-
         rows.append(row)
         audit.append({"query": q, "status": "ok", "resolved": row})
         logger.info(f"OK: {q} -> {row['uniprot_acc']}")
@@ -336,7 +321,8 @@ def uniprot_main(scope_path, seeds_path, cache_path, out_tsv, out_json, log_path
         raise SystemExit(f"Fail ambiguous: {ambiguous}")
 
     write_tsv(out_tsv, rows)
-    Path(out_json).parent.mkdir(parents=True, exist_ok=True)
+    p = Path(out_json)
+    p.parent.mkdir(parents=True, exist_ok=True)
     json.dump(
         {
             "scope": {"taxon_id": scope.taxon_id, "canonical_id": scope.canonical_id},
@@ -345,11 +331,10 @@ def uniprot_main(scope_path, seeds_path, cache_path, out_tsv, out_json, log_path
             "unmapped": unmapped,
             "ambiguous": ambiguous,
         },
-        open(out_json, "w", encoding="utf-8"),
+        p.open("w", encoding="utf-8"),
         indent=2,
         ensure_ascii=False,
     )
-
     logger.info(f"Wrote {out_tsv}")
     logger.info(f"Wrote {out_json}")
 
@@ -375,25 +360,20 @@ def main():
     u.add_argument("--log", required=True)
 
     a = ap.parse_args()
-
     if a.cmd == "download":
-        dataloader_main(**vars(a))
+        dataloader_main(
+            root=a.root,
+            string_version=a.string_version,
+            taxid=a.taxid,
+            with_biogrid=a.with_biogrid,
+            with_elm=a.with_elm,
+            overwrite=a.overwrite,
+        )
     elif a.cmd == "uniprot":
         uniprot_main(a.scope, a.seeds, a.cache, a.out_tsv, a.out_json, a.log)
     else:
         raise SystemExit(a.cmd)
 
-
-CHUNK = 1024 * 1024
-
-ROOT = Path(__file__).resolve().parent
-SEEDS = str(ROOT / "inputs/seeds/seeds.init.tsv")
-ATTR = ROOT / "inputs/annotations/nodes.attributes.tsv"
-OUT = ROOT / "inputs/seeds/seeds.mapped.tsv"
-
-UNIPROT_RE = re.compile(
-    r"\b([A-NR-Z][0-9][A-Z0-9]{3}[0-9]|[OPQ][0-9][A-Z0-9]{3}[0-9]|A0A[0-9A-Z]{7})\b"
-)
 
 if __name__ == "__main__":
     main()

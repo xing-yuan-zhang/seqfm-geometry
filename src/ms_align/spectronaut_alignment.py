@@ -1,6 +1,4 @@
-# src/helpers/spectronaut_alignment.py
 import argparse
-import os
 import re
 from pathlib import Path
 from typing import List, Set, Tuple, Optional
@@ -10,7 +8,9 @@ import networkx as nx
 import matplotlib.pyplot as plt
 
 
-UNIPROT_RE = re.compile(r"^(?:[A-NR-Z][0-9][A-Z0-9]{3}[0-9]|[OPQ][0-9][A-Z0-9]{3}[0-9]|A0A[A-Z0-9]{7,10})$")
+UNIPROT_RE = re.compile(
+    r"^(?:[A-NR-Z][0-9][A-Z0-9]{3}[0-9]|[OPQ][0-9][A-Z0-9]{3}[0-9]|A0A[A-Z0-9]{7,10})$"
+)
 SPLIT_RE = re.compile(r"[;,\s]+")
 
 
@@ -52,7 +52,12 @@ def detect_uniprot_column(df: pd.DataFrame, user_col: Optional[str]) -> str:
             continue
         hit = s.map(lambda v: 1.0 if extract_uniprots_from_cell(v) else 0.0).mean()
         bonus = 0.05 if str(col).lower() in {
-            "entry", "accession", "uniprot", "uniprot_id", "protein", "pg.proteinaccessions"
+            "entry",
+            "accession",
+            "uniprot",
+            "uniprot_id",
+            "protein",
+            "pg.proteinaccessions",
         } else 0.0
         score = hit + bonus
         if score > best_score:
@@ -133,6 +138,59 @@ def draw_ms_graph(G: nx.Graph, out_png: str, max_nodes: int, seed: int):
     plt.tight_layout()
     plt.savefig(out_png, dpi=300)
     plt.close()
+
+
+def draw_top_pf_graph(edges: pd.DataFrame, pf_df: pd.DataFrame, out_png: str, topk: int, seed: int):
+    top_nodes = pf_df.head(topk)["uniprot"].tolist()
+    sub_edges = induced_subgraph_edges(edges, set(top_nodes))
+    G = build_graph_from_edges(sub_edges)
+
+    if G.number_of_nodes() == 0:
+        return
+
+    pos = nx.spring_layout(G, seed=seed, k=0.08)
+    for n in pos:
+        pos[n] *= 0.6
+
+    plt.figure(figsize=(9, 9))
+    nx.draw_networkx_edges(G, pos, edge_color="#c0c0c0", alpha=0.18, width=0.8)
+    nx.draw_networkx_nodes(G, pos, node_size=380, node_color="#4f83cc", linewidths=0)
+    nx.draw_networkx_labels(G, pos, font_size=10)
+
+    plt.title(f"Top-{topk} Pillar/Flat ratio (STRING)")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+
+
+def compute_pf_ratio(ms_tsv: Path) -> pd.DataFrame:
+    df = pd.read_csv(ms_tsv, sep="\t", low_memory=False)
+
+    q_cols = [c for c in df.columns if c.endswith(".PG.Quantity")]
+    if len(q_cols) < 2:
+        raise ValueError("need both Flat and Pillar quantity columns")
+
+    flat_col = [c for c in q_cols if "Flat" in c][0]
+    pillar_col = [c for c in q_cols if "Pillar" in c][0]
+
+    df["Flat"] = pd.to_numeric(df[flat_col], errors="coerce")
+    df["Pillar"] = pd.to_numeric(df[pillar_col], errors="coerce")
+    df = df.dropna(subset=["Flat", "Pillar"])
+    df = df[(df["Flat"] > 0) & (df["Pillar"] > 0)]
+
+    df["PF_ratio"] = df["Pillar"] / df["Flat"]
+
+    df["uniprot"] = df["PG.ProteinAccessions"].map(extract_uniprots_from_cell)
+    df = df.explode("uniprot")
+    df = df[df["uniprot"].str.len() > 0]
+
+    out = (
+        df.groupby(["uniprot", "PG.Genes"], as_index=False)["PF_ratio"]
+        .mean()
+        .sort_values("PF_ratio", ascending=False)
+    )
+    return out
 
 
 def draw_overlay(
@@ -245,6 +303,18 @@ def main():
         str(outdir / "overlay_ms_vs_diffusion.png"),
         args.max_nodes_overlay,
         args.seed,
+    )
+
+    pf_df = compute_pf_ratio(ROOT / args.ms_tsv)
+    pf_df.to_csv(outdir / "pf_ratio_ranked.tsv", sep="\t", index=False)
+
+    draw_top_pf_graph(string_df, pf_df, str(outdir / "top_pf_ratio.png"), 100, args.seed)
+    draw_top_pf_graph(
+        string_df,
+        pf_df,
+        str(outdir / "top50_pf_ratio_string.png"),
+        topk=50,
+        seed=args.seed,
     )
 
 

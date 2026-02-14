@@ -1,4 +1,3 @@
-# src/graph_constructor/merge_condensate_attributes.py
 from __future__ import annotations
 
 import argparse

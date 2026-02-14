@@ -1,4 +1,3 @@
-# src/graph_diffusion/diffusion_naive.py
 from __future__ import annotations
 
 import argparse

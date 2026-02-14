@@ -1,4 +1,3 @@
-# src/data_utils/ppi_alignment.py
 import argparse
 import gzip
 import re

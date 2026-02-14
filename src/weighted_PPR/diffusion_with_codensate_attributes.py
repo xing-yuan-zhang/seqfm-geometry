@@ -1,4 +1,3 @@
-# src/graph_diffusion/diffusion_with_condensate_attributes.py
 from __future__ import annotations
 
 import argparse

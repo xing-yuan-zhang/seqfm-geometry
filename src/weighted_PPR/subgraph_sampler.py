@@ -1,6 +1,6 @@
-# src/graph_constructor/subgraph_sampler.py
 import argparse
 import heapq
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -145,6 +145,131 @@ def pick_seed_set(seeds_df: pd.DataFrame, seed_roles: list[str], allow_missing_r
     return set(df["entry"].tolist())
 
 
+def _sigmoid(x: float) -> float:
+    if x >= 40:
+        return 1.0
+    if x <= -40:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def soft_rank_subgraph(
+    edges_path: Path,
+    base_nodes: set[str],
+    seed_scores: dict[str, float],
+    steps: int,
+    decay: float,
+    min_string_weight: float,
+    temp: float,
+    string_power: float,
+    biogrid_physical_only: bool,
+    biogrid_boost: float,
+    frontier_topk: int,
+    chunksize: int = 2_000_000,
+) -> dict[str, float]:
+    scores = defaultdict(float)
+    frontier = dict(seed_scores)
+
+    for k, v in seed_scores.items():
+        if k in base_nodes:
+            scores[k] = max(scores[k], float(v))
+
+    for _ in range(int(steps)):
+        if not frontier:
+            break
+
+        if frontier_topk > 0 and len(frontier) > frontier_topk:
+            frontier = dict(sorted(frontier.items(), key=lambda x: x[1], reverse=True)[:frontier_topk])
+
+        nxt = defaultdict(float)
+        active = set(frontier.keys())
+
+        for chunk in pd.read_csv(edges_path, sep="\t", chunksize=chunksize):
+            miss = {"entry_a", "entry_b"} - set(chunk.columns)
+            if miss:
+                raise ValueError(f"edges file missing columns: {sorted(miss)}")
+
+            c = chunk[build_keep_mask(chunk, min_string_weight, biogrid_physical_only)]
+            if c.empty:
+                continue
+
+            a = c["entry_a"].astype(str)
+            b = c["entry_b"].astype(str)
+
+            in_base = a.isin(base_nodes) & b.isin(base_nodes)
+            if not in_base.any():
+                continue
+
+            c = c[in_base]
+            if c.empty:
+                continue
+
+            a = c["entry_a"].astype(str)
+            b = c["entry_b"].astype(str)
+
+            ma = a.isin(active)
+            mb = b.isin(active)
+            if not (ma.any() or mb.any()):
+                continue
+
+            if "is_biogrid" in c.columns:
+                cb = c[c["is_biogrid"] == 1]
+                if not cb.empty:
+                    ab = cb["entry_a"].astype(str)
+                    bb = cb["entry_b"].astype(str)
+                    m1 = ab.isin(active)
+                    m2 = bb.isin(active)
+
+                    for u, v in zip(ab[m1], bb[m1]):
+                        su = frontier.get(str(u), 0.0)
+                        if su > 0:
+                            nxt[str(v)] += su * float(decay) * float(biogrid_boost)
+
+                    for u, v in zip(bb[m2], ab[m2]):
+                        su = frontier.get(str(u), 0.0)
+                        if su > 0:
+                            nxt[str(v)] += su * float(decay) * float(biogrid_boost)
+
+            if "is_string" in c.columns:
+                cs = c[c["is_string"] == 1]
+                if not cs.empty:
+                    as_ = cs["entry_a"].astype(str)
+                    bs_ = cs["entry_b"].astype(str)
+                    ws_ = cs["weight"].astype(float)
+
+                    ms_a = as_.isin(active)
+                    ms_b = bs_.isin(active)
+
+                    t = float(temp) if float(temp) > 1e-9 else 1e-9
+                    p = float(string_power)
+
+                    for u, v, w in zip(as_[ms_a], bs_[ms_a], ws_[ms_a]):
+                        su = frontier.get(str(u), 0.0)
+                        if su <= 0:
+                            continue
+                        gate = _sigmoid((float(w) - float(min_string_weight)) / t)
+                        ew = (max(float(w), 0.0) ** p) * gate
+                        if ew > 0:
+                            nxt[str(v)] += su * float(decay) * ew
+
+                    for u, v, w in zip(bs_[ms_b], as_[ms_b], ws_[ms_b]):
+                        su = frontier.get(str(u), 0.0)
+                        if su <= 0:
+                            continue
+                        gate = _sigmoid((float(w) - float(min_string_weight)) / t)
+                        ew = (max(float(w), 0.0) ** p) * gate
+                        if ew > 0:
+                            nxt[str(v)] += su * float(decay) * ew
+
+        for k, v in nxt.items():
+            if k in base_nodes and v > scores[k]:
+                scores[k] = float(v)
+
+        frontier = dict(nxt)
+
+    return dict(scores)
+
+
 def main():
     ROOT = Path(__file__).resolve().parents[2]
 
@@ -153,41 +278,28 @@ def main():
     ap.add_argument("--seeds", default=str(ROOT / "inputs/seeds/seeds.mapped.tsv"))
     ap.add_argument("--hops", type=int, default=2, choices=[1, 2])
 
-    ap.add_argument(
-        "--min-string-weight",
-        type=float,
-        default=0.90,
-        help="combined_score/1000 threshold, 0.85~0.95",
-    )
-    ap.add_argument(
-        "--biogrid-physical-only",
-        action="store_true",
-        default=False,
-        help="keep only BioGRID edges with biogrid_physical==1",
-    )
-    ap.add_argument(
-        "--topk-string-per-node",
-        type=int,
-        default=100,
-        help="keep only top-K STRING neighbors during expanding",
-    )
+    ap.add_argument("--min-string-weight", type=float, default=0.90, help="combined_score/1000 threshold, 0.85~0.95")
+    ap.add_argument("--biogrid-physical-only", action="store_true", default=False)
+    ap.add_argument("--topk-string-per-node", type=int, default=100, help="hard expansion only (STRING topK)")
     ap.add_argument("--max-nodes", type=int, default=50000)
     ap.add_argument("--outdir", default=str(ROOT / "inputs/ppi/subgraph"))
 
-    ap.add_argument(
-        "--seed-roles",
-        default="Src-family-kinase,CIP4-TOCA-family,FBP17,TOCA-1"
-    )
-    ap.add_argument(
-        "--allow-missing-role",
-        action="store_true",
-        default=False,
-    )
+    ap.add_argument("--seed-roles", default="Src-family-kinase,CIP4-TOCA-family,FBP17,TOCA-1")
+    ap.add_argument("--allow-missing-role", action="store_true", default=False)
 
-    ap.add_argument("--patch-seed", default=None, help="do local patch expansion for this seed")
-    ap.add_argument("--patch-hops", type=int, default=3, choices=[1, 2, 3], help="local patch hops for --patch-seed (default 3)")
-    ap.add_argument("--patch-min-string-weight", type=float, default=None, help="override min-string-weight for patch only")
-    ap.add_argument("--patch-topk-string-per-node", type=int, default=None, help="override topk-string-per-node for patch only")
+    ap.add_argument("--patch-seed", default=None)
+    ap.add_argument("--patch-hops", type=int, default=3, choices=[1, 2, 3])
+    ap.add_argument("--patch-min-string-weight", type=float, default=None)
+    ap.add_argument("--patch-topk-string-per-node", type=int, default=None)
+
+    ap.add_argument("--soft", action="store_true", default=False)
+    ap.add_argument("--soft-steps", type=int, default=6)
+    ap.add_argument("--soft-decay", type=float, default=0.75)
+    ap.add_argument("--soft-temp", type=float, default=0.02)
+    ap.add_argument("--soft-string-power", type=float, default=1.0)
+    ap.add_argument("--soft-biogrid-boost", type=float, default=1.0)
+    ap.add_argument("--soft-frontier-topk", type=int, default=4000)
+    ap.add_argument("--soft-topm", type=int, default=20000)
 
     args = ap.parse_args()
 
@@ -200,7 +312,7 @@ def main():
     seed_set = pick_seed_set(seeds_df, seed_roles=seed_roles, allow_missing_role=args.allow_missing_role)
     seed_set = {x for x in seed_set if x and str(x).lower() != "nan"}
     if not seed_set:
-        raise ValueError()
+        raise ValueError("empty seed_set")
 
     n1 = scan_collect_neighbors(
         edges_path=edges_path,
@@ -209,17 +321,17 @@ def main():
         biogrid_physical_only=args.biogrid_physical_only,
         topk_string_per_node=args.topk_string_per_node,
     )
-    nodes = set(seed_set) | set(n1)
+    base_nodes = set(seed_set) | set(n1)
 
     if args.hops == 2:
         n2 = scan_collect_neighbors(
             edges_path=edges_path,
-            active=nodes,
+            active=base_nodes,
             min_string_weight=args.min_string_weight,
             biogrid_physical_only=args.biogrid_physical_only,
             topk_string_per_node=args.topk_string_per_node,
         )
-        nodes |= set(n2)
+        base_nodes |= set(n2)
 
     patch_seed = str(args.patch_seed).strip()
     if patch_seed and patch_seed.lower() != "none":
@@ -236,7 +348,7 @@ def main():
             )
             patch_nodes = {patch_seed} | set(p1)
 
-            if args.patch_hops == 2:
+            if args.patch_hops >= 2:
                 p2 = scan_collect_neighbors(
                     edges_path=edges_path,
                     active=patch_nodes,
@@ -246,9 +358,19 @@ def main():
                 )
                 patch_nodes |= set(p2)
 
-            before = len(nodes)
-            nodes |= patch_nodes
-            after = len(nodes)
+            if args.patch_hops >= 3:
+                p3 = scan_collect_neighbors(
+                    edges_path=edges_path,
+                    active=patch_nodes,
+                    min_string_weight=patch_minw,
+                    biogrid_physical_only=args.biogrid_physical_only,
+                    topk_string_per_node=patch_topk,
+                )
+                patch_nodes |= set(p3)
+
+            before = len(base_nodes)
+            base_nodes |= patch_nodes
+            after = len(base_nodes)
             print(
                 f"patch_seed={patch_seed} patch_hops={args.patch_hops} "
                 f"minw={patch_minw} topk={patch_topk} added_nodes={after-before:,}"
@@ -256,8 +378,45 @@ def main():
         else:
             print(f"patch_seed={patch_seed} not in seed_set.")
 
-    if len(nodes) > args.max_nodes:
-        raise ValueError(f"node number {len(nodes)} exceeds max_nodes={args.max_nodes}.")
+    if len(base_nodes) > args.max_nodes:
+        raise ValueError(f"base node number {len(base_nodes)} exceeds max_nodes={args.max_nodes} (tune hops/topk/minw)")
+
+    nodes = set(base_nodes)
+
+    if args.soft:
+        seed_scores = {s: 1.0 for s in seed_set}
+        scores = soft_rank_subgraph(
+            edges_path=edges_path,
+            base_nodes=base_nodes,
+            seed_scores=seed_scores,
+            steps=args.soft_steps,
+            decay=args.soft_decay,
+            min_string_weight=args.min_string_weight,
+            temp=args.soft_temp,
+            string_power=args.soft_string_power,
+            biogrid_physical_only=args.biogrid_physical_only,
+            biogrid_boost=args.soft_biogrid_boost,
+            frontier_topk=args.soft_frontier_topk,
+        )
+
+        cand = [(v, k) for k, v in scores.items() if k not in seed_set]
+        cand.sort(reverse=True)
+
+        topm = int(args.soft_topm)
+        if topm <= 0:
+            topm = len(cand)
+
+        pick = [k for _, k in cand[:topm]]
+        nodes = set(seed_set) | set(pick)
+
+        if len(nodes) > args.max_nodes:
+            nodes = set(seed_set) | set([k for _, k in cand[: max(0, args.max_nodes - len(seed_set))]])
+
+        print(
+            f"soft=1 base_nodes={len(base_nodes):,} picked_nodes={len(nodes):,} "
+            f"steps={args.soft_steps} decay={args.soft_decay} temp={args.soft_temp} "
+            f"topm={args.soft_topm} frontier_topk={args.soft_frontier_topk}"
+        )
 
     outdir.mkdir(parents=True, exist_ok=True)
     out_nodes = outdir / "subgraph_nodes.tsv"
