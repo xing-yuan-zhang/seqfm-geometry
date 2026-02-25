@@ -25,25 +25,17 @@ def main():
     ap.add_argument("--info", default="string_info.tsv")
     ap.add_argument("--seqs", default="9606.protein.sequences.v12.0.fa")
     ap.add_argument("--outdir", default=".")
-    a = ap.parse_args()
 
     base = Path(__file__).resolve().parent
-    P = lambda x: (base / x) if x and not Path(x).is_absolute() else Path(x)
-    outdir = P(a.outdir); outdir.mkdir(parents=True, exist_ok=True)
-
-    info = pd.read_csv(P(a.info), sep="\t", dtype=str)
-    if "string_id" not in info.columns:
-        info = info.rename(columns={info.columns[0]: "string_id"})
+    outdir = base / ap.parse_args().outdir; outdir.mkdir(parents=True, exist_ok=True)
+    info = pd.read_csv(base / ap.parse_args().info, sep="\t", dtype=str)
     sids = info["string_id"].astype(str).tolist()
-
-    seqm = read_fa(P(a.seqs))
+    seqm = read_fa(base / ap.parse_args().seqs)
 
     keep = []
     for sid in sids:
         seq = seqm.get(sid)
-        if not seq:
-            continue
-        keep.append((sid, seq))
+        keep.append((sid, seq)) if seq else None
     
     with open(outdir / "node_ids.txt", "w", encoding="utf-8") as f:
         for sid, _ in keep:

@@ -1,0 +1,164 @@
+import os
+import argparse
+import numpy as np
+
+def read_ids(path):
+    if not path:
+        return None
+    xs = []
+    with open(path, "r") as f:
+        for line in f:
+            xs.append(line.strip())
+    return set(xs)
+
+def read_edges(path):
+    edges = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            s = line.split("\t")
+            if len(s) < 2 or s[0].startswith("node"):
+                continue
+            u, v = s[0], s[1]
+            if u != v:
+                edges.append((u, v))
+    return edges
+
+def write_nodes(path, xs):
+    with open(path, "w") as f:
+        for x in xs:
+            f.write(str(x) + "\n")
+
+def write_edges(path, edges):
+    with open(path, "w") as f:
+        for u, v in edges:
+            f.write(u + "\t" + v + "\n")
+
+def dedup_undirected(edges):
+    seen = set()
+    out = []
+    for u, v in edges:
+        a, b = (u, v) if u < v else (v, u)
+        if (a, b) in seen:
+            continue
+        seen.add((a, b))
+        out.append((a, b))
+    return out
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--emb_npz", required=True)
+    ap.add_argument("--ppi_edges", required=True)
+    ap.add_argument("--v_final", required=True)
+    ap.add_argument("--outdir", default=".")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--train_frac", type=float, default=0.8)
+    ap.add_argument("--val_frac", type=float, default=0.1)
+    ap.add_argument("--split", choices=["node", "edge"], default="edge")
+    ap.add_argument("--dedup_undirected", action="store_true")
+    args = ap.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    z = np.load(args.emb_npz, allow_pickle=True)
+    ids = list(z["ids"])
+    idset = set(ids)
+
+    v_final = read_ids(args.v_final)
+    if v_final is None:
+        v_final = idset
+    else:
+        v_final = v_final & idset
+
+    edges = read_edges(args.ppi_edges)
+    edges = [(u, v) for (u, v) in edges if (u in v_final and v in v_final)]
+    if args.dedup_undirected:
+        edges = dedup_undirected(edges)
+
+    rng = np.random.RandomState(args.seed)
+
+    if args.split == "edge":
+        rng.shuffle(edges)
+        m = len(edges)
+        m_train = int(m * args.train_frac)
+        m_val = int(m * args.val_frac)
+
+        trE = edges[:m_train]
+        vaE = edges[m_train:m_train + m_val]
+        teE = edges[m_train + m_val:]
+
+        train_nodes = sorted(set([u for u, v in trE] + [v for u, v in trE]))
+        val_nodes = sorted(set([u for u, v in vaE] + [v for u, v in vaE]))
+        test_nodes = sorted(set([u for u, v in teE] + [v for u, v in teE]))
+
+        meta = {
+            "split": "edge",
+            "n_nodes_total": len(v_final),
+            "n_edges_total": m,
+            "n_train_pos": len(trE),
+            "n_val_pos": len(vaE),
+            "n_test_pos": len(teE),
+            "n_train_nodes": len(train_nodes),
+            "n_val_nodes": len(val_nodes),
+            "n_test_nodes": len(test_nodes),
+            "seed": args.seed,
+            "dedup_undirected": int(args.dedup_undirected),
+        }
+
+    else:
+        nodes = sorted(set([u for u, _ in edges] + [v for _, v in edges]))
+        rng.shuffle(nodes)
+
+        n = len(nodes)
+        n_train = int(n * args.train_frac)
+        n_val = int(n * args.val_frac)
+
+        train_nodes = set(nodes[:n_train])
+        val_nodes = set(nodes[n_train:n_train + n_val])
+        test_nodes = set(nodes[n_train + n_val:])
+
+        def filt_edges(node_set):
+            out = []
+            for u, v in edges:
+                if u in node_set and v in node_set:
+                    out.append((u, v))
+            return out
+
+        trE = filt_edges(train_nodes)
+        vaE = filt_edges(val_nodes)
+        teE = filt_edges(test_nodes)
+
+        train_nodes = sorted(train_nodes)
+        val_nodes = sorted(val_nodes)
+        test_nodes = sorted(test_nodes)
+
+        meta = {
+            "split": "node",
+            "n_nodes_total": len(v_final),
+            "n_nodes_with_edges": n,
+            "n_train_nodes": len(train_nodes),
+            "n_val_nodes": len(val_nodes),
+            "n_test_nodes": len(test_nodes),
+            "n_train_pos": len(trE),
+            "n_val_pos": len(vaE),
+            "n_test_pos": len(teE),
+            "seed": args.seed,
+            "dedup_undirected": int(args.dedup_undirected),
+        }
+
+    write_nodes(os.path.join(args.outdir, "train_nodes.txt"), train_nodes)
+    write_nodes(os.path.join(args.outdir, "val_nodes.txt"), val_nodes)
+    write_nodes(os.path.join(args.outdir, "test_nodes.txt"), test_nodes)
+
+    write_edges(os.path.join(args.outdir, "train_pos_edges.tsv"), trE)
+    write_edges(os.path.join(args.outdir, "val_pos_edges.tsv"), vaE)
+    write_edges(os.path.join(args.outdir, "test_pos_edges.tsv"), teE)
+
+    with open(os.path.join(args.outdir, "meta.txt"), "w") as f:
+        for k in sorted(meta.keys()):
+            f.write(f"{k}\t{meta[k]}\n")
+
+if __name__ == "__main__":
+    main()
