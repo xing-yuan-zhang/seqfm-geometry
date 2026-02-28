@@ -44,8 +44,9 @@ def slide_seq(s, win, stride):
     return out
 
 @torch.no_grad()
-def embed_windows(model, tok, parts, device, max_len, bs):
-    out_vecs = []
+def embed_windows(model, tok, parts, device, max_len, bs, use_amp):
+    acc = None
+    n = 0
     for i in range(0, len(parts), bs):
         b = parts[i:i+bs]
         b = [" ".join(list(x)) for x in b]
@@ -58,16 +59,27 @@ def embed_windows(model, tok, parts, device, max_len, bs):
             max_length=max_len,
             add_special_tokens=True
         )
-        x = {k:v.to(device) for k,v in x.items()}
+        x = {k: v.to(device) for k, v in x.items()}
 
-        h = model(**x).last_hidden_state
+        if use_amp and device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                h = model(**x).last_hidden_state
+        else:
+            h = model(**x).last_hidden_state
+
         attn = x["attention_mask"].bool()
-
         m = attn.unsqueeze(-1).to(h.dtype)
         v = (h * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
-        out_vecs.append(v)
 
-    return torch.cat(out_vecs, dim=0).mean(dim=0)
+        s = v.sum(dim=0)
+        acc = s if acc is None else (acc + s)
+        n += v.shape[0]
+
+        del h, attn, m, v, s, x
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    return acc / max(n, 1)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -81,9 +93,13 @@ def main():
     ap.add_argument("--win_bs", type=int, default=16)
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--l2norm", action="store_true")
+    ap.add_argument("--cpu_threads", type=int, default=4)
     args = ap.parse_args()
 
+    torch.set_num_threads(max(1, args.cpu_threads))
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_amp = bool(args.fp16 and device == "cuda")
 
     base = Path(__file__).resolve().parent
     seqs = read_fasta(base / args.fasta)
@@ -93,13 +109,22 @@ def main():
     model = AutoModel.from_pretrained(args.model).eval().to(device)
     model = model.get_encoder()
 
+    D = int(getattr(model.config, "d_model", 0) or getattr(model.config, "hidden_size", 0))
+    if D <= 0:
+        raise RuntimeError("cannot infer embedding dim from model config")
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    dtype = np.float16 if (args.fp16 and device == "cuda") else np.float32
+    mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=dtype, shape=(len(ids), D))
+
     items = []
     for nid in ids:
         s = seqs.get(nid)
         if s is None:
             raise RuntimeError(f"missing sequence: {nid}")
         items.append((nid, s, len(s)))
-
     items.sort(key=lambda x: x[2])
 
     buckets = {}
@@ -107,29 +132,37 @@ def main():
         k = (L // args.bucket) * args.bucket
         buckets.setdefault(k, []).append((nid, s))
 
-    embs = [None] * len(ids)
-    idx_map = {nid:i for i, nid in enumerate(ids)}
-
+    idx_map = {nid: i for i, nid in enumerate(ids)}
     pbar = tqdm(total=len(ids), desc="Embedding (ProtT5)")
 
-    with torch.no_grad():
-        for k in sorted(buckets.keys()):
-            group = buckets[k]
-            for nid, s in group:
-                parts = slide_seq(s, args.max_len, args.stride)
-                v = embed_windows(model, tok, parts, device, args.max_len, args.win_bs)
-                if args.fp16 and device == "cuda":
-                    v = v.half()
-                embs[idx_map[nid]] = v.cpu()
-                pbar.update(1)
+    for k in sorted(buckets.keys()):
+        group = buckets[k]
+        for nid, s in group:
+            parts = slide_seq(s, args.max_len, args.stride)
+            v = embed_windows(model, tok, parts, device, args.max_len, args.win_bs, use_amp)
+            i = idx_map[nid]
+            if dtype == np.float16:
+                mm[i, :] = v.float().cpu().numpy().astype(np.float16, copy=False)
+            else:
+                mm[i, :] = v.float().cpu().numpy()
+            if (pbar.n + 1) % 256 == 0:
+                mm.flush()
+            pbar.update(1)
 
     pbar.close()
+    mm.flush()
 
-    E = torch.stack(embs, dim=0).numpy()
     if args.l2norm:
-        E = l2norm_rows(E.astype(np.float32)).astype(E.dtype, copy=False)
-
-    np.save(base / args.out, E)
+        mm2 = np.lib.format.open_memmap(out_path, mode="r+", dtype=dtype, shape=(len(ids), D))
+        bs = 4096
+        for i in range(0, len(ids), bs):
+            x = np.array(mm2[i:i+bs], dtype=np.float32, copy=True)
+            x = l2norm_rows(x)
+            if dtype == np.float16:
+                mm2[i:i+bs] = x.astype(np.float16, copy=False)
+            else:
+                mm2[i:i+bs] = x
+        mm2.flush()
 
 if __name__ == "__main__":
     main()
