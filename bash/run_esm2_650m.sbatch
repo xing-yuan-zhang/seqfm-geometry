@@ -4,12 +4,14 @@
 #SBATCH -A marlowe-m000226-free
 #SBATCH -N 1
 #SBATCH -c 4
-#SBATCH --mem=8G
+#SBATCH --mem=64G
 #SBATCH -t 48:00:00
 #SBATCH -o logs/%x.%j.out
 #SBATCH -e logs/%x.%j.err
 
 set -euo pipefail
+
+mkdir -p logs
 
 source /projects/m000226/miniconda3/etc/profile.d/conda.sh
 conda activate plm
@@ -25,6 +27,7 @@ export TRANSFORMERS_OFFLINE=1
 
 SCRIPT_DIR=/projects/m000226/seqfm-geometry/src/emb
 OUT_DIR=/projects/m000226/seqfm-geometry/outputs
+mkdir -p "$OUT_DIR"
 
 python $SCRIPT_DIR/emb_esm2.py \
   --model facebook/esm2_t33_650M_UR50D \
@@ -34,5 +37,6 @@ python $SCRIPT_DIR/emb_esm2.py \
   --max_len 1022 \
   --stride 768 \
   --bucket 128 \
-  --win_bs 64 \
+  --win_bs 8 \
+  --cpu_threads 4 \
   --l2norm
