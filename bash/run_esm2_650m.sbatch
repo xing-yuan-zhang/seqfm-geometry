@@ -4,7 +4,7 @@
 #SBATCH -A marlowe-m000226-free
 #SBATCH -N 1
 #SBATCH -c 4
-#SBATCH -g 1
+#SBATCH -G 1
 #SBATCH --mem=64G
 #SBATCH -t 48:00:00
 #SBATCH -o logs/%x.%j.out

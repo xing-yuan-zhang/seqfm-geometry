@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-#SBATCH -J fmppi
+#SBATCH -J knn_sm
 #SBATCH -p batch
 #SBATCH -A marlowe-m000226-free
 #SBATCH -N 1
 #SBATCH -c 4
-#SBATCH -g 1
+#SBATCH -G 1
 #SBATCH --mem=64G
 #SBATCH -t 48:00:00
 #SBATCH -o logs/%x.%j.out
 #SBATCH -e logs/%x.%j.err
-
 set -euo pipefail
 
 mkdir -p logs
