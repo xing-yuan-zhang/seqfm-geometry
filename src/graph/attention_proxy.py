@@ -1,4 +1,3 @@
-# phase2_2_unsup_fmppi.py
 import os
 import argparse
 import numpy as np
@@ -47,8 +46,12 @@ def attn_cross_score(model, tok, seqA, seqB, device, linker_len=10):
     linker = "X" * linker_len
     s = seqA + linker + seqB
     x = tok(s, return_tensors="pt", add_special_tokens=True)
-    x = {k:v.to(device) for k,v in x.items()}
+    x = {k: v.to(device) for k, v in x.items()}
     out = model(**x, output_attentions=True)
+
+    if out.attentions is None or len(out.attentions) == 0:
+        raise RuntimeError("No attentions returned. Use attn_implementation='eager'.")
+
     attn = out.attentions[-1][0].mean(dim=0)
 
     L = attn.shape[0]
@@ -253,9 +256,15 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.model_name, do_lower_case=False)
     if args.method in ["pll", "perturb"]:
-        model = AutoModelForMaskedLM.from_pretrained(args.model_name).to(device).eval()
+        model = AutoModelForMaskedLM.from_pretrained(
+            args.model_name,
+            attn_implementation="eager",
+        ).to(device).eval()
     else:
-        model = AutoModel.from_pretrained(args.model_name).to(device).eval()
+        model = AutoModel.from_pretrained(
+            args.model_name,
+            attn_implementation="eager",
+        ).to(device).eval()
 
     G = X @ X.T
     np.fill_diagonal(G, -1.0)
