@@ -37,8 +37,8 @@ python $SCRIPT_DIR/attention_proxy.py \
   --nodes $DATA_DIR/node_ids.txt \
   --model_name facebook/esm2_t33_650M_UR50D \
   --method perturb \
-  --cand_M 300 \
+  --cand_M 20 \
   --topm 20 \
-  --perturb_k 8 \
-  --score_k 64 \
+  --perturb_k 2 \
+  --score_k 32 \
   --outdir $OUT_DIR

@@ -37,7 +37,7 @@ python $SCRIPT_DIR/attention_proxy.py \
   --nodes $DATA_DIR/node_ids.txt \
   --model_name facebook/esm2_t33_650M_UR50D \
   --method pll \
-  --pll_sample_k 64 \
-  --cand_M 200 \
-  --topm 20 \
+  --pll_sample_k 8 \
+  --cand_M 10 \
+  --topm 10 \
   --outdir $OUT_DIR
