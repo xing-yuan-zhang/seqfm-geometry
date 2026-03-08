@@ -461,7 +461,7 @@ def main():
                     linker_len=args.linker_len,
                     perturb_k=args.perturb_k,
                     score_k=args.score_k,
-                    seed=args.seed + 1000003 * i + 97 * int(j),
+                    seed=(args.seed + 1000003 * i + 97 * int(j)) % (2**32 - 1),
                     amp_dtype=amp_dtype,
                 )
 
