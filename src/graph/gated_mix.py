@@ -75,7 +75,7 @@ def main():
     out = [(u, v, w) for (u, v), w in mix.items() if w > 0]
     out.sort()
 
-    out_path = os.path.join(args.outdir, f"mix_gated_lam{args.lambda_:g}_beta{args.beta:g}_{args.g}.tsv")
+    out_path = os.path.join(args.outdir, f"mix_gated_lam_{args.fmppi_edges.split('/')[-1].split('.')[0]}_{args.lambda_:g}_beta{args.beta:g}_{args.g}.tsv")
     write_edges3(out_path, out)
 
 if __name__ == "__main__":

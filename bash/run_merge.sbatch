@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH -J pll
+#SBATCH -J merge
 #SBATCH -p batch
 #SBATCH -A marlowe-m000226-free
 #SBATCH -N 1
 #SBATCH -c 4
 #SBATCH --mem=64G
 #SBATCH -t 1:00:00
-#SBATCH --array=0-9
 #SBATCH -o logs/%x.%A_%a.out
 #SBATCH -e logs/%x.%A_%a.err
 

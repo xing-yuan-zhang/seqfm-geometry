@@ -64,7 +64,7 @@ def main():
             g = 1.0 + args.beta * p
         out.append((u, v, float(w * g)))
 
-    out_path = os.path.join(args.outdir, f"string_reweight_beta{args.beta:g}_{args.f}.tsv")
+    out_path = os.path.join(args.outdir, f"string_reweight_beta_{args.fmppi_edges.split('/')[-1].split('.')[0]}_{args.beta:g}_{args.f}.tsv")
     write_edges3(out_path, out)
 
 if __name__ == "__main__":
