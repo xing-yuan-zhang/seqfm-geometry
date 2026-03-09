@@ -1,3 +1,7 @@
+"""
+Compute attention-based or pseudo-log-likelihood-based coupling scores for pairs of sequences.
+"""
+
 import os
 import math
 import argparse

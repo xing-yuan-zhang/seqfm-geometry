@@ -17,13 +17,3 @@ temp/
 
 inputs/**
 outputs/**
-
-!inputs/README.md
-!inputs/.gitkeep
-!inputs/examples/**
-!outputs/README.md
-!outputs/.gitkeep
-!outputs/examples/**
-
-*.env
-configs/**/secrets.*

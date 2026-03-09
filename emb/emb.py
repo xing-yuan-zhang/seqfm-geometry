@@ -1,4 +1,30 @@
-import argparse
+"""
+Embedding STRING nodelist with ESM2 or ProtT5.
+
+Output:
+- A .npz file containing:
+  - ids: an array of node IDs (dtype=object)
+  - emb: an array of node embeddings (dtype=float32, shape=(n_nodes, embedding_dim))
+
+Call:
+    from emb import embed_main
+    res = embed_main(
+        backend="esm2",
+        model="esm2_t33_650M_UR50D",
+        fasta="nodes.fasta",
+        node_ids="nodes.ids",
+        out="embeddings.npz",
+        max_len=1022,
+        stride=768,
+        bucket=128,
+        win_bs=16,
+        fp16=True,
+        l2norm=True,
+        cpu_threads=4,
+        keep_npy=False,
+    )
+"""
+
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
@@ -44,11 +70,15 @@ def slide_seq(s, win, stride):
     return out
 
 @torch.no_grad()
-def embed_windows_esm2(model, tok, parts, device, max_len, bs, use_amp):
+def embed_windows(model, tok, parts, device, max_len, bs, use_amp, seq_transform=None, drop_special=False):
     acc = None
     n = 0
+
     for i in range(0, len(parts), bs):
         b = parts[i:i+bs]
+        if seq_transform is not None:
+            b = [seq_transform(x) for x in b]
+
         x = tok(
             b,
             return_tensors="pt",
@@ -67,59 +97,27 @@ def embed_windows_esm2(model, tok, parts, device, max_len, bs, use_amp):
 
         attn = x["attention_mask"].bool()
 
-        keep = attn.clone()
-        keep[:, 0] = False
-        lens = attn.long().sum(dim=1)
-        last = torch.clamp(lens - 1, min=0)
-        keep[torch.arange(keep.size(0), device=keep.device), last] = False
+        if drop_special:
+            keep = attn.clone()
+            keep[:, 0] = False
+            lens = attn.long().sum(dim=1)
+            last = torch.clamp(lens - 1, min=0)
+            keep[torch.arange(keep.size(0), device=keep.device), last] = False
+            m = keep.unsqueeze(-1).to(h.dtype)
+            denom = m.sum(dim=1).clamp_min(1.0)
+        else:
+            m = attn.unsqueeze(-1).to(h.dtype)
+            denom = m.sum(dim=1).clamp_min(1.0)
 
-        m = keep.unsqueeze(-1).to(h.dtype)
-        denom = m.sum(dim=1).clamp_min(1.0)
         v = (h * m).sum(dim=1) / denom
-
         s = v.sum(dim=0)
+
         acc = s if acc is None else (acc + s)
         n += v.size(0)
 
-        del h, attn, keep, m, denom, v, s, x
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-    return acc / max(n, 1)
-
-@torch.no_grad()
-def embed_windows_prott5(model, tok, parts, device, max_len, bs, use_amp):
-    acc = None
-    n = 0
-    for i in range(0, len(parts), bs):
-        b = parts[i:i+bs]
-        b = [" ".join(list(x)) for x in b]
-
-        x = tok(
-            b,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_len,
-            add_special_tokens=True,
-        )
-        x = {k: v.to(device) for k, v in x.items()}
-
-        if use_amp and device == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                h = model(**x).last_hidden_state
-        else:
-            h = model(**x).last_hidden_state
-
-        attn = x["attention_mask"].bool()
-        m = attn.unsqueeze(-1).to(h.dtype)
-        v = (h * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
-
-        s = v.sum(dim=0)
-        acc = s if acc is None else (acc + s)
-        n += v.size(0)
-
-        del h, attn, m, v, s, x
+        del h, attn, m, denom, v, s, x
+        if drop_special:
+            del keep, lens, last
         if device == "cuda":
             torch.cuda.empty_cache()
 
@@ -133,6 +131,7 @@ def build_model(backend, model_name, device):
         if D <= 0:
             raise RuntimeError("cannot infer embedding dim from model config")
         return tok, model, D
+
     if backend == "prott5":
         tok = AutoTokenizer.from_pretrained(model_name, do_lower_case=False, use_fast=False)
         m = AutoModel.from_pretrained(model_name).eval().to(device)
@@ -141,35 +140,34 @@ def build_model(backend, model_name, device):
         if D <= 0:
             raise RuntimeError("cannot infer embedding dim from model config")
         return tok, model, D
-    raise RuntimeError("backend must be esm2 or prott5")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["esm2", "prott5"], required=True)
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--fasta", required=True)
-    ap.add_argument("--node_ids", required=True)
-    ap.add_argument("--out", required=True)  # npz
-    ap.add_argument("--max_len", type=int, default=None)
-    ap.add_argument("--stride", type=int, default=768)
-    ap.add_argument("--bucket", type=int, default=128)
-    ap.add_argument("--win_bs", type=int, default=16)
-    ap.add_argument("--fp16", action="store_true")
-    ap.add_argument("--l2norm", action="store_true")
-    ap.add_argument("--cpu_threads", type=int, default=4)
-    ap.add_argument("--keep_npy", action="store_true")
-    args = ap.parse_args()
+    raise RuntimeError(f"unsupported backend: {backend}")
 
-    torch.set_num_threads(max(1, args.cpu_threads))
+def embed_main(
+    backend,
+    model,
+    fasta,
+    node_ids,
+    out,
+    max_len=None,
+    stride=768,
+    bucket=128,
+    win_bs=16,
+    fp16=False,
+    l2norm=False,
+    cpu_threads=4,
+    keep_npy=False,
+):
+    torch.set_num_threads(max(1, cpu_threads))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    use_amp = bool(args.fp16 and device == "cuda")
+    use_amp = bool(fp16 and device == "cuda")
 
-    if args.max_len is None:
-        args.max_len = 1022 if args.backend == "esm2" else 1024
+    if max_len is None:
+        max_len = 1022 if backend == "esm2" else 1024
 
-    fasta_path = Path(args.fasta)
-    ids_path = Path(args.node_ids)
-    out_npz = Path(args.out)
+    fasta_path = Path(fasta)
+    ids_path = Path(node_ids)
+    out_npz = Path(out)
     out_npz.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_npy = out_npz.with_suffix(".npy")
@@ -177,9 +175,9 @@ def main():
     seqs = read_fasta(fasta_path)
     ids = read_ids(ids_path)
 
-    tok, model, D = build_model(args.backend, args.model, device)
+    tok, model_obj, D = build_model(backend, model, device)
 
-    dtype = np.float16 if (args.fp16 and device == "cuda") else np.float32
+    dtype = np.float16 if (fp16 and device == "cuda") else np.float32
     mm = np.lib.format.open_memmap(tmp_npy, mode="w+", dtype=dtype, shape=(len(ids), D))
 
     items = []
@@ -192,19 +190,33 @@ def main():
 
     buckets = {}
     for nid, s, L in items:
-        k = (L // args.bucket) * args.bucket
+        k = (L // bucket) * bucket
         buckets.setdefault(k, []).append((nid, s))
 
     idx_map = {nid: i for i, nid in enumerate(ids)}
-    pbar = tqdm(total=len(ids), desc=f"Embedding ({args.backend})")
+    pbar = tqdm(total=len(ids), desc=f"Embedding ({backend})")
+
+    if backend == "esm2":
+        seq_transform = None
+        drop_special = True
+    else:
+        seq_transform = lambda x: " ".join(list(x))
+        drop_special = False
 
     for k in sorted(buckets.keys()):
         for nid, s in buckets[k]:
-            parts = slide_seq(s, args.max_len, args.stride)
-            if args.backend == "esm2":
-                v = embed_windows_esm2(model, tok, parts, device, args.max_len, args.win_bs, use_amp)
-            else:
-                v = embed_windows_prott5(model, tok, parts, device, args.max_len, args.win_bs, use_amp)
+            parts = slide_seq(s, max_len, stride)
+            v = embed_windows(
+                model_obj,
+                tok,
+                parts,
+                device,
+                max_len,
+                win_bs,
+                use_amp,
+                seq_transform=seq_transform,
+                drop_special=drop_special,
+            )
 
             i = idx_map[nid]
             if dtype == np.float16:
@@ -219,7 +231,7 @@ def main():
     pbar.close()
     mm.flush()
 
-    if args.l2norm:
+    if l2norm:
         mm2 = np.lib.format.open_memmap(tmp_npy, mode="r+", dtype=dtype, shape=(len(ids), D))
         bs = 4096
         for i in range(0, len(ids), bs):
@@ -234,11 +246,17 @@ def main():
     emb = np.load(tmp_npy, mmap_mode=None)
     np.savez(out_npz, ids=np.array(ids, dtype=object), emb=emb.astype(np.float32))
 
-    if not args.keep_npy:
+    if not keep_npy:
         try:
             tmp_npy.unlink()
         except Exception:
             pass
 
-if __name__ == "__main__":
-    main()
+    return {
+        "backend": backend,
+        "model": model,
+        "device": device,
+        "out": str(out_npz),
+        "n_ids": len(ids),
+        "dim": D,
+    }

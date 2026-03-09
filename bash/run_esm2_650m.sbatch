@@ -26,20 +26,26 @@ export HF_HUB_CACHE=$HF_HOME/hub
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-SCRIPT_DIR=/projects/m000226/seqfm-geometry/src/emb
-DATA_DIR=/projects/m000226/seqfm-geometry/parent_graph/
+export PYTHONPATH=/projects/m000226/seqfm-geometry/src/emb:$PYTHONPATH
+
+DATA_DIR=/projects/m000226/seqfm-geometry/parent_graph
 OUT_DIR=/projects/m000226/seqfm-geometry/emb
 mkdir -p "$OUT_DIR"
 
-python $SCRIPT_DIR/emb.py \
-  --backend esm2 \
-  --model facebook/esm2_t33_650M_UR50D \
-  --fasta $DATA_DIR/seqs.fasta \
-  --node_ids $DATA_DIR/node_ids.txt \
-  --out $OUT_DIR/esm2_t33_650m.npz \
-  --max_len 1022 \
-  --stride 768 \
-  --bucket 128 \
-  --win_bs 8 \
-  --cpu_threads 4 \
-  --l2norm
+python - << 'EOF'
+from emb import embed_main
+
+embed_main(
+    backend="esm2",
+    model="facebook/esm2_t33_650M_UR50D",
+    fasta="/projects/m000226/seqfm-geometry/parent_graph/seqs.fasta",
+    node_ids="/projects/m000226/seqfm-geometry/parent_graph/node_ids.txt",
+    out="/projects/m000226/seqfm-geometry/emb/esm2_t33_650m.npz",
+    max_len=1022,
+    stride=768,
+    bucket=128,
+    win_bs=8,
+    cpu_threads=4,
+    l2norm=True,
+)
+EOF

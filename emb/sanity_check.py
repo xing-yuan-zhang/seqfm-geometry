@@ -1,3 +1,15 @@
+"""
+Sanity check for ESM2 or ProtT5 embeddings:
+- Check for NaN/Inf values in a random sample of rows.
+- Check the distribution of row norms and values.
+- Check the distribution of top cosine similarities among random samples.
+- Check the correlation between sequence length and embedding norm.
+
+Call:
+    from sanity_check import sanity_check
+    sanity_check("embeddings.npz", "nodes.length")
+"""
+
 import numpy as np
 
 def _rand_idx(n, k, seed=0):

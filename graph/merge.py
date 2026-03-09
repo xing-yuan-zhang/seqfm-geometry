@@ -10,7 +10,7 @@ def main():
 
     files = sorted(glob.glob(args.glob))
     if len(files) == 0:
-        raise RuntimeError("no files matched")
+        raise RuntimeError()
 
     d = {}
     n_in = 0
@@ -39,10 +39,6 @@ def main():
     with open(args.out, "w") as f:
         for u, v, w in out:
             f.write(u + "\t" + v + "\t" + f"{w:.6g}" + "\n")
-
-    print("n_files", len(files))
-    print("n_lines_in", n_in)
-    print("n_edges_out", len(out))
 
 if __name__ == "__main__":
     main()
